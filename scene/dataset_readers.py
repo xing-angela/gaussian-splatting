@@ -25,6 +25,7 @@ from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
 from utils import param_utils
+from glob import glob
 
 class CameraInfo(NamedTuple):
     uid: int
@@ -530,12 +531,131 @@ def trajectory_circle(radius, altitude, frames, center):
 
     return cam_infos
 
-# ----------- BRICS baby trajectory ----------- #
+########################################### BRICS Data END ###########################################
 
-########################################### BRICS Data ###########################################
+########################################### DTU Data ###########################################
+
+def readDtuCameras(params_path, images_folder):
+    data = np.load(params_path)
+
+    img_files = glob(os.path.join(images_folder, "*.png"))
+
+    cam_infos = []
+    for i in range(0, len(data.files), 6):
+
+        # loads the image
+        img_file = img_files[i // 6]
+        img_name = img_file.split("/")[-1]
+        img = cv2.imread(img_file, cv2.IMREAD_UNCHANGED)
+
+        w, h = img.shape[1], img.shape[0]
+
+        scale_mat = data[data.files[i]]
+        # scale_mat_inv = data[data.files[i + 1]]
+        world_mat = data[data.files[i + 2]]
+        # world_mat_inv = data[data.files[i + 3]]
+        # cam_mat = data[data.files[i + 4]]
+        # cam_mat_inv = data[data.files[i + 5]]
+
+        K, R, tvec = cv2.decomposeProjectionMatrix(world_mat[:3])[:3]
+        K = K / K[2, 2]
+
+        fx, fy = K[0, 0], K[1, 1]
+        fovx = 2 * math.atan(w / (2 * fx))
+        fovy = 2 * math.atan(h / (2 * fy))
+
+        # scale the tvec (which is c2w)
+        tvec = (tvec[:3] / tvec[3])[:, 0]
+        norm_trans = scale_mat[:3, 3]
+        norm_scale = np.diagonal(scale_mat[:3, :3])
+        tvec -= norm_trans
+        tvec /= norm_scale
+
+        T = -R @ tvec
+        R = np.transpose(R)
+
+        # handles alpha channel if there's segmentation
+        if img.shape[-1] == 4:
+            b, g, r, alpha = cv2.split(img)
+
+            rgb = np.stack([r, g, b], axis=-1)
+            alpha = alpha[..., np.newaxis] / 255.0
+            mask = alpha
+
+            rgb = rgb / 255.0
+            rgb = rgb * alpha
+        else:
+            b, g, r = cv2.split(img)
+            rgb = np.stack([r, g, b], axis=-1)
+            rgb = rgb / 255.0
+
+        image = Image.fromarray(np.uint8(rgb*255))
+
+        cam_info = CameraInfo(uid=i//6, R=R, T=T, FovY=fovy, FovX=fovx, image=image,
+                              image_path=img_file, image_name=img_name, width=int(w), height=int(h))
+        cam_infos.append(cam_info)
+    return cam_infos
+
+
+def readDtuSceneInfo(path, eval, traj):
+    params_path = os.path.join(path, "cameras.npz")
+    images_folder = os.path.join(path, "images")
+    cam_infos = readDtuCameras(params_path, images_folder)
+
+    if eval:
+        eval_cams = [0, 41]
+        train_cam_infos = [c for c in cam_infos if c.uid not in eval_cams]
+        test_cam_infos = [c for c in cam_infos if c.uid in eval_cams]
+    else:
+        train_cam_infos = cam_infos
+        test_cam_infos = []
+
+    if traj:
+        # trajectory rendering for the original crib rendering
+        # traj_cam_infos = trajectory_circle(0.3, 3.0, 300, (-1.5, 1.2, 0.5))
+        
+        # traj linear
+        # traj_cam_infos = trajectory_line((-1.0, -1.0, 0.0), (-0.75, 2.5, -1.75), 300, 3.3)
+
+        # trajectory semi
+        traj_cam_infos = trajectory_semi(0.3, 0.3, 10, (-1.5, 1.2, 0.2))
+    else:
+        traj_cam_infos = []
+
+
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+
+    ply_path = os.path.join(path, "points_cleaned.ply")
+    if not os.path.exists(ply_path):
+        print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+        try:
+            xyz, rgb, _ = read_points3D_binary(bin_path)
+        except:
+            xyz, rgb, _ = read_points3D_text(txt_path)
+        storePly(ply_path, xyz, rgb)
+
+    # this will sample points from a mesh
+    # xyz, rgb = sample_gaussians(path, 300000)
+    # storePly(ply_path, xyz, rgb)
+    
+    try:
+        pcd = fetchPly(ply_path)
+    except:
+        pcd = None
+
+    scene_info = SceneInfo(point_cloud=pcd,
+                           train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           traj_cameras=traj_cam_infos,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path)
+    return scene_info
+
+########################################### DTU Data END ###########################################
 
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
     "Blender" : readNerfSyntheticInfo,
-    "BRICS" : readBricsSceneInfo
+    "BRICS" : readBricsSceneInfo,
+    "DTU" : readDtuSceneInfo
 }

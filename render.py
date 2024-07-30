@@ -61,7 +61,7 @@ if __name__ == "__main__":
     parser.add_argument("--skip_test", action="store_true")
     parser.add_argument("--skip_traj", action="store_true")
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--scene_type", default="BRICS", choices=["BRICS", "Colmap", "Blender"])
+    parser.add_argument("--scene_type", default="BRICS", choices=["BRICS", "Colmap", "Blender", "DTU"])
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)
 

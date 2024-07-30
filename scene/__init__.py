@@ -48,6 +48,8 @@ class Scene:
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval, args.trajectory)
         elif scene_type == "BRICS":
             scene_info = sceneLoadTypeCallbacks["BRICS"](args.source_path, args.eval, args.trajectory)
+        elif scene_type == "DTU":
+            scene_info = sceneLoadTypeCallbacks["DTU"](args.source_path, args.eval, args.trajectory)
         else:
             assert False, "Could not recognize scene type!"
 
