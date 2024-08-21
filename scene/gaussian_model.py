@@ -20,6 +20,8 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
+import pickle as pkl
+import transforms3d
 
 class GaussianModel:
 
@@ -27,8 +29,9 @@ class GaussianModel:
         def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
             L = build_scaling_rotation(scaling_modifier * scaling, rotation)
             actual_covariance = L @ L.transpose(1, 2)
-            symm = strip_symmetric(actual_covariance)
-            return symm
+            # symm = strip_symmetric(actual_covariance)
+            # return symm
+            return actual_covariance
         
         self.scaling_activation = torch.exp
         self.scaling_inverse_activation = torch.log
@@ -146,6 +149,40 @@ class GaussianModel:
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
+    def create_from_fmb(self, fmb_file : str, spatial_lr_scale : float, pcd : BasicPointCloud):
+        self.spatial_lr_scale = spatial_lr_scale
+
+        with open(fmb_file, 'rb') as file:
+            params = pkl.load(file)
+        fused_point_cloud = torch.tensor(params['mean']).float().cuda()
+        sh_coeffs = torch.tensor(params['sh_coeffs']).reshape((fused_point_cloud.shape[0], 3, -1))
+        features = sh_coeffs.float().cuda()
+
+        print("Number of points at initialisation : ", fused_point_cloud.shape[0])
+        
+        scales = np.zeros((fused_point_cloud.shape[0], 3))
+        rots = np.ones((fused_point_cloud.shape[0], 4))
+        prec = np.array(params['prec'])
+        for i in range(prec.shape[0]):
+            preco = prec[i]
+            covar = np.linalg.pinv(preco.T @ preco)
+            eig_values, eig_vectors = np.linalg.eigh(covar)
+            scales[i] = np.sqrt(eig_values)
+            rots[i] = transforms3d.quaternions.mat2quat(eig_vectors)
+
+        scales = torch.from_numpy(scales).float().cuda()
+        rots = torch.from_numpy(rots).float().cuda()
+        
+        opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+
+        self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
+        self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
+        self._scaling = nn.Parameter(scales.requires_grad_(True))
+        self._rotation = nn.Parameter(rots.requires_grad_(True))
+        self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -198,6 +235,8 @@ class GaussianModel:
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
+
+        print("Number of gaussians saving : ", xyz.shape[0])
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 

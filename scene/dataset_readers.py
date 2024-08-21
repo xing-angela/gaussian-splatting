@@ -13,6 +13,7 @@ import os
 import cv2
 import sys
 import math
+import json
 from PIL import Image
 from typing import NamedTuple
 from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
@@ -25,7 +26,6 @@ from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
 from utils import param_utils
-from glob import glob
 
 class CameraInfo(NamedTuple):
     uid: int
@@ -267,340 +267,41 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
                            ply_path=ply_path)
     return scene_info
 
-########################################### BRICS Data ###########################################
-
-def sample_gaussians(path, sample_size, sample_mesh=False):
-    import trimesh
-    mesh_dir = os.path.join(path, "mesh")
-    mesh_name = os.listdir(mesh_dir)[0]
-    mesh = trimesh.load(os.path.join(mesh_dir, mesh_name), process=False, maintain_order=True)
-    points = mesh.sample(sample_size)
-    points_colors = torch.rand(points.shape)
-    return points, points_colors
-
-def readBricsCameras(params_path, images_folder):
-    params = param_utils.read_params(params_path)
-
-    # skips the bottom side cameras due to reflections
-    skip_images = [
-        "brics-sbc-003_cam0",
-        "brics-sbc-003_cam1",
-        "brics-sbc-004_cam1",
-        "brics-sbc-008_cam0",
-        "brics-sbc-008_cam1",
-        "brics-sbc-009_cam0",
-        "brics-sbc-013_cam0",
-        "brics-sbc-013_cam1",
-        "brics-sbc-014_cam0",
-        "brics-sbc-018_cam0",
-        "brics-sbc-018_cam1",
-        "brics-sbc-019_cam0",
-    ]
-
-    cam_infos = []
-    for idx, cam in enumerate(params):
-        extr = param_utils.get_extr(cam)
-        K, dist = param_utils.get_intr(cam)
-        
-        cam_name = cam["cam_name"]
-
-        if cam_name in skip_images:
-            continue
-
-        img_dir = os.path.join(images_folder, cam_name)
-        img = os.listdir(img_dir)[0]
-        img_path = os.path.join(img_dir, img)
-        img_name = os.path.basename(img_path).split(".")[0]
-        img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
-
-        w, h = cam["width"], cam["height"]
-        new_K, roi = param_utils.get_undistort_params(K, dist, (w, h))
-        img = param_utils.undistort_image(K, new_K, dist, img)
-        new_K = new_K.astype(np.float32)
-        extr = extr.astype(np.float32)
-
-        fx, fy = new_K[0, 0], new_K[1, 1]
-        fovx = 2 * math.atan(w / (2 * fx))
-        fovy = 2 * math.atan(h / (2 * fy))
-
-        R = np.transpose(extr[:, :3])
-        T = extr[:, 3]
-
-        # handles alpha channel if there's segmentation
-        if img.shape[-1] == 4:
-            b, g, r, alpha = cv2.split(img)
-
-            rgb = np.stack([r, g, b], axis=-1)
-            alpha = alpha[..., np.newaxis] / 255.0
-            mask = alpha
-
-            rgb = rgb / 255.0
-            rgb = rgb * alpha
-        else:
-            b, g, r = cv2.split(img)
-            rgb = np.stack([r, g, b], axis=-1)
-            rgb = rgb / 255.0
-
-        image = Image.fromarray(np.uint8(rgb*255))
-
-        cam_info = CameraInfo(uid=cam["cam_id"], R=R, T=T, FovY=fovy, FovX=fovx, image=image,
-                              image_path=img_path, image_name=img_name, width=int(w), height=int(h))
-        cam_infos.append(cam_info)
-    return cam_infos
-
-def readBricsSceneInfo(path, eval, traj):
-    params_path = os.path.join(path, "calib", "params.txt")
-    images_folder = os.path.join(path, "images", "image")
-    cam_infos = readBricsCameras(params_path, images_folder)
-
-    if eval:
-        # eval_cams = [1, 17, 18, 34, 44, 45] # for diva dataset
-        eval_cams = [1, 17] # for BRICS baby
-        train_cam_infos = [c for c in cam_infos if c.uid not in eval_cams]
-        test_cam_infos = [c for c in cam_infos if c.uid in eval_cams]
-    else:
-        train_cam_infos = cam_infos
-        test_cam_infos = []
-
-    if traj:
-        # trajectory rendering for the original crib rendering
-        # traj_cam_infos = trajectory_circle(0.3, 3.0, 300, (-1.5, 1.2, 0.5))
-        
-        # traj linear
-        # traj_cam_infos = trajectory_line((-1.0, -1.0, 0.0), (-0.75, 2.5, -1.75), 300, 3.3)
-
-        # trajectory semi
-        traj_cam_infos = trajectory_semi(0.3, 0.3, 10, (-1.5, 1.2, 0.2))
-    else:
-        traj_cam_infos = []
-
-
-    nerf_normalization = getNerfppNorm(train_cam_infos)
-
-    ply_path = os.path.join(path, "pc/dense/points3D.ply")
-    if not os.path.exists(ply_path):
-        print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
-        try:
-            xyz, rgb, _ = read_points3D_binary(bin_path)
-        except:
-            xyz, rgb, _ = read_points3D_text(txt_path)
-        storePly(ply_path, xyz, rgb)
-
-    # this will sample points from a mesh
-    # xyz, rgb = sample_gaussians(path, 300000)
-    # storePly(ply_path, xyz, rgb)
-    
-    try:
-        pcd = fetchPly(ply_path)
-    except:
-        pcd = None
-
-    scene_info = SceneInfo(point_cloud=pcd,
-                           train_cameras=train_cam_infos,
-                           test_cameras=test_cam_infos,
-                           traj_cameras=traj_cam_infos,
-                           nerf_normalization=nerf_normalization,
-                           ply_path=ply_path)
-    return scene_info
-
-# ----------- BRICS baby trajectory ----------- #
-def normalize(v):
-    norm = np.linalg.norm(v)
-    if norm == 0:
-        return v
-    return v / norm
-
-def trajectory_line(start, end, frames, altitude):
-    sx, sy, sz = start
-    ex, ey, ez = end
-
-    stepx = (ex - sx) / frames
-    stepy = (ey - sy) / frames
-    stepz = (ez - sz) / frames
-
-    cam_infos = []
-
-    for i in range(frames):
-        x = sx + i * stepx
-        y = sy + i * stepy
-        z = sz + i * stepz
-
-        T = np.array([x, y, z + altitude])
-
-        # Compute rotation matrix
-        up = normalize(np.array(start) - np.array(end))
-        right = normalize(np.array([start[0], start[1] + 1.0, start[2]]))
-        forward = normalize(np.cross(right, up))
-
-        # Rotation matrix columns are the right, up, and forward vectors
-        R = np.column_stack((right, up, forward))
-        R = np.transpose(R)
-
-        img = np.zeros((720, 1280, 3)).astype(np.uint8)
-        image = Image.fromarray(img)
-
-        # hard-coding from brics baby calib
-        fx = 909.652853959504
-        fy = 914.8168124848717
-        FovX = 2 * math.atan(1280 / (2 * fx))
-        FovY = 2 * math.atan(720 / (2 * fy))
-
-        cam_name = f"{i:03d}"
-
-        cam_infos.append(CameraInfo(uid=i, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                        image_path=cam_name, image_name=f"{cam_name}.jpg", width=image.size[0], height=image.size[1]))
-
-    return cam_infos
-
-def trajectory_semi(radius, altitude, frames, center):
-    center_x, center_y, center_z = center
-
-    angles = np.linspace(0, np.pi, frames, endpoint=False)
-    cam_infos = []
-
-    for i, angle in enumerate(angles):
-        x = center_x + radius * np.cos(angle)
-        y = center_y + radius * np.sin(angle)
-        z = center_z + altitude
-
-        T = np.array([x, y, z])
-
-        forward = normalize(np.array([center_x - x, center_y - y, 0.0]))
-        up = np.array([0, 0, 1])
-        right = normalize(np.cross(forward, up))
-
-        # Rotation matrix columns are the right, up, and forward vectors
-        R = np.column_stack((right, up, forward))
-        R = np.transpose(R)
-
-        img = np.zeros((720, 1280, 3)).astype(np.uint8)
-        image = Image.fromarray(img)
-
-        # hard-coding from brics baby calib
-        fx = 909.652853959504
-        fy = 914.8168124848717
-        FovX = 2 * math.atan(1280 / (2 * fx))
-        FovY = 2 * math.atan(720 / (2 * fy))
-
-        cam_name = f"{i:03d}"
-
-        cam_infos.append(CameraInfo(uid=i, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                        image_path=cam_name, image_name=f"{cam_name}.jpg", width=image.size[0], height=image.size[1]))
-
-    return cam_infos
-
-
-
-def trajectory_circle(radius, altitude, frames, center):
-    center_x, center_y, center_z = center
-
-    angles = np.linspace(0, 2 * np.pi, frames, endpoint=False)
-    cam_infos = []
-
-    for idx, angle in enumerate(angles):
-        x = center_x + radius * np.cos(angle)
-        y = center_y + radius * np.sin(angle)
-        z = center_z + altitude
-
-        # Translation vector
-        T = np.array([x, y, z])
-
-        # Compute rotation matrix
-        forward = normalize(np.array([center_x - x, y - center_y, center_z]))
-        world_up = np.array([0, 0, 1])
-        right = normalize(np.cross(world_up, forward))
-        up = np.cross(forward, right)
-
-        # Rotation matrix columns are the right, up, and forward vectors
-        R = np.column_stack((right, up, forward))
-        R = np.transpose(R)
-
-        img = np.zeros((720, 1280, 3)).astype(np.uint8)
-        image = Image.fromarray(img)
-
-        # hard-coding from brics baby calib
-        fx = 909.652853959504
-        fy = 914.8168124848717
-        FovX = 2 * math.atan(1280 / (2 * fx))
-        FovY = 2 * math.atan(720 / (2 * fy))
-
-        cam_name = f"{idx:03d}"
-
-        cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                        image_path=cam_name, image_name=f"{cam_name}.jpg", width=image.size[0], height=image.size[1]))
-
-    return cam_infos
-
-########################################### BRICS Data END ###########################################
-
 ########################################### DTU Data ###########################################
 
-def readDtuCameras(params_path, images_folder):
-    data = np.load(params_path)
+def readDtuCameras(params_path, images_folder, masks_folder):
+    with open(params_path) as f:
+        data = json.load(f)["cameras"]
 
-    img_files = glob(os.path.join(images_folder, "*.png"))
+    images = sorted(os.listdir(images_folder))
+    assert(len(data) == len(images))
 
     cam_infos = []
-    for i in range(0, len(data.files), 6):
+    for i in range(len(data)):
+        cam = data[i]
+        R = np.array(cam["R"])
+        T = np.array(cam["tvec"])
+        fovy = cam["fovy"]
+        fovx = cam["fovx"]
 
-        # loads the image
-        img_file = img_files[i // 6]
-        img_name = img_file.split("/")[-1]
-        img = cv2.imread(img_file, cv2.IMREAD_UNCHANGED)
+        image_path = os.path.join(images_folder, images[i])
+        image = np.asarray(Image.open(image_path))
+        h, w, _ = image.shape
+        mask_path = os.path.join(masks_folder, images[i].replace(".jpg", ".png"))
+        mask = np.asarray(Image.open(mask_path)) / 255
+        image = Image.fromarray((image * mask[..., None]).astype(np.uint8))
 
-        w, h = img.shape[1], img.shape[0]
-
-        scale_mat = data[data.files[i]]
-        # scale_mat_inv = data[data.files[i + 1]]
-        world_mat = data[data.files[i + 2]]
-        # world_mat_inv = data[data.files[i + 3]]
-        # cam_mat = data[data.files[i + 4]]
-        # cam_mat_inv = data[data.files[i + 5]]
-
-        K, R, tvec = cv2.decomposeProjectionMatrix(world_mat[:3])[:3]
-        K = K / K[2, 2]
-
-        fx, fy = K[0, 0], K[1, 1]
-        fovx = 2 * math.atan(w / (2 * fx))
-        fovy = 2 * math.atan(h / (2 * fy))
-
-        # scale the tvec (which is c2w)
-        tvec = (tvec[:3] / tvec[3])[:, 0]
-        norm_trans = scale_mat[:3, 3]
-        norm_scale = np.diagonal(scale_mat[:3, :3])
-        tvec -= norm_trans
-        tvec /= norm_scale
-
-        T = -R @ tvec
-        R = np.transpose(R)
-
-        # handles alpha channel if there's segmentation
-        if img.shape[-1] == 4:
-            b, g, r, alpha = cv2.split(img)
-
-            rgb = np.stack([r, g, b], axis=-1)
-            alpha = alpha[..., np.newaxis] / 255.0
-            mask = alpha
-
-            rgb = rgb / 255.0
-            rgb = rgb * alpha
-        else:
-            b, g, r = cv2.split(img)
-            rgb = np.stack([r, g, b], axis=-1)
-            rgb = rgb / 255.0
-
-        image = Image.fromarray(np.uint8(rgb*255))
-
-        cam_info = CameraInfo(uid=i//6, R=R, T=T, FovY=fovy, FovX=fovx, image=image,
-                              image_path=img_file, image_name=img_name, width=int(w), height=int(h))
+        cam_info = CameraInfo(uid=i, R=R, T=T, FovY=fovy, FovX=fovx, image=image,
+                              image_path=images[i], image_name=images[i].split(".")[0], width=int(w), height=int(h))
         cam_infos.append(cam_info)
     return cam_infos
 
 
 def readDtuSceneInfo(path, eval, traj):
-    params_path = os.path.join(path, "cameras.npz")
-    images_folder = os.path.join(path, "images")
-    cam_infos = readDtuCameras(params_path, images_folder)
+    params_path = os.path.join(path, "cameras.json")
+    images_folder = os.path.join(path, "JPEGImages", "video1")
+    masks_folder = os.path.join(path, "masks", "video1")
+    cam_infos = readDtuCameras(params_path, images_folder, masks_folder)
 
     if eval:
         eval_cams = [0, 41]
@@ -610,33 +311,23 @@ def readDtuSceneInfo(path, eval, traj):
         train_cam_infos = cam_infos
         test_cam_infos = []
 
-    if traj:
-        # trajectory rendering for the original crib rendering
-        # traj_cam_infos = trajectory_circle(0.3, 3.0, 300, (-1.5, 1.2, 0.5))
-        
-        # traj linear
-        # traj_cam_infos = trajectory_line((-1.0, -1.0, 0.0), (-0.75, 2.5, -1.75), 300, 3.3)
-
-        # trajectory semi
-        traj_cam_infos = trajectory_semi(0.3, 0.3, 10, (-1.5, 1.2, 0.2))
-    else:
-        traj_cam_infos = []
-
+    traj_cam_infos = []
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
-    ply_path = os.path.join(path, "points_cleaned.ply")
-    if not os.path.exists(ply_path):
-        print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
-        try:
-            xyz, rgb, _ = read_points3D_binary(bin_path)
-        except:
-            xyz, rgb, _ = read_points3D_text(txt_path)
-        storePly(ply_path, xyz, rgb)
+    # ply_path = None
+    # pcd = None
 
-    # this will sample points from a mesh
-    # xyz, rgb = sample_gaussians(path, 300000)
-    # storePly(ply_path, xyz, rgb)
+    # ply_path = '/users/axing2/data/datasets/mvs_training/dtu/Points/stl/stl065_total.ply'
+    # ply_path = '/users/axing2/data/users/axing2/GSExperiments/Experiments/FMB/fmb-plus/dataset/scan65/points.ply'
+    ply_path='/users/axing2/data/datasets/mvs_training/dtu/Points/scan65/points.ply'
+    # if not os.path.exists(ply_path):
+    #     print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+    #     try:
+    #         xyz, rgb, _ = read_points3D_binary(bin_path)
+    #     except:
+    #         xyz, rgb, _ = read_points3D_text(txt_path)
+    #     storePly(ply_path, xyz, rgb)
     
     try:
         pcd = fetchPly(ply_path)
@@ -656,6 +347,5 @@ def readDtuSceneInfo(path, eval, traj):
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
     "Blender" : readNerfSyntheticInfo,
-    "BRICS" : readBricsSceneInfo,
     "DTU" : readDtuSceneInfo
 }

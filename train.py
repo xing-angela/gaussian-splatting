@@ -10,6 +10,7 @@
 #
 
 import os
+import json
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
@@ -27,6 +28,42 @@ try:
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
+    
+import matplotlib.pyplot as plt
+def save_number_of_gaussian_progression(data_, save_path):
+    print(f'Saving plot for number of Gaussians during training at : {save_path}')
+    # Create a plot
+    plt.plot(data_)
+
+    #Get important points 
+    imporant_points = []
+
+    #Lambda expression to make sure that important point index is in the range of len(data_)
+    add_imp_points = lambda x : imporant_points.append( (x, data_[x]) ) if x < len(data_) else print(f'Important point {x} does not exist in the data.')
+
+    add_imp_points(0)
+    add_imp_points(5000)
+    add_imp_points(7000)
+    add_imp_points(10000)
+    add_imp_points(15000)
+
+    # Annotate important points
+    offset_x_annot_point = int(0.9 * len(data_))
+    for imp_point in imporant_points:
+        offset_y_annot_point = imp_point[1] if imp_point[0] < 15000 else data_[imp_point[0]-1000]
+        plt.annotate(f'{imp_point[1]}', #Add the value  
+                 xy=imp_point, 
+                 xytext=(offset_x_annot_point, offset_y_annot_point),
+                 arrowprops=dict(facecolor='black', arrowstyle='->', linestyle='dotted'))
+
+    # Add labels and title if needed
+    plt.xlabel('Iterations')
+    plt.ylabel('No. of Gaussians')
+    plt.title('Progression of number of Gaussians during training')
+
+    # Save the plot to a file (e.g., PNG, PDF, SVG)
+    plt.savefig(os.path.join( save_path, 'num_gaussians.png') )
+    plt.close()
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, scene_type):
     first_iter = 0
@@ -48,41 +85,28 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
-    for iteration in range(first_iter, opt.iterations + 1):        
-        if network_gui.conn == None:
-            network_gui.try_connect()
-        while network_gui.conn != None:
-            try:
-                net_image_bytes = None
-                custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
-                if custom_cam != None:
-                    net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer)["render"]
-                    net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
-                network_gui.send(net_image_bytes, dataset.source_path)
-                if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
-                    break
-            except Exception as e:
-                network_gui.conn = None
-
+    total_gaussians_propagation = []
+    times = []
+    curr_time = 0
+    for iteration in range(first_iter, opt.iterations + 1):
         iter_start.record()
-
         gaussians.update_learning_rate(iteration)
-
+        times.append(curr_time)
+        total_gaussians_propagation.append(scene.gaussians.get_xyz.shape[0])
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
-
+            
         # Pick a random Camera
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
-
+        
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
-
         bg = torch.rand((3), device="cuda") if opt.random_background else background
-
+        
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
@@ -91,9 +115,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         Ll1 = l1_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
         loss.backward()
-
         iter_end.record()
-
+        
         with torch.no_grad():
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
@@ -104,8 +127,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
+            curr_time += iter_start.elapsed_time(iter_end)
             training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
-            if (iteration in saving_iterations):
+            # if (iteration in saving_iterations):
+            if iteration % 1000 == 0:
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
 
@@ -118,7 +143,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
-                
+
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
 
@@ -130,6 +155,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+
+    with open(os.path.join(scene.model_path, "log_info.json"), "w") as log_file:
+        data = {"total_gaussians": total_gaussians_propagation, "time": times}
+        json.dump(data, log_file)
+
+    print('Total Gaussians after training ', scene.gaussians.get_xyz.shape[0])
+    save_number_of_gaussian_progression(total_gaussians_propagation, scene.model_path)
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -160,12 +192,14 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
         tb_writer.add_scalar('iter_time', elapsed, iteration)
 
     # Report test and samples of training set
-    if iteration in testing_iterations:
+    # if iteration in testing_iterations:
+    if iteration % 1000 == 0:
         torch.cuda.empty_cache()
         validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
                               {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
 
         for config in validation_configs:
+            config_metric = {}
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
@@ -181,6 +215,8 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                 psnr_test /= len(config['cameras'])
                 l1_test /= len(config['cameras'])          
                 print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+                config_metric["PSNR"] = psnr_test.cpu().item()
+                config_metric["L1"] = l1_test.cpu().item()
                 if tb_writer:
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
                     tb_writer.add_scalar(config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
@@ -200,12 +236,12 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[2_000, 5_000, 7_000, 30_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[2_000, 5_000, 7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
-    parser.add_argument("--scene_type", default="BRICS", choices=["BRICS", "Colmap", "Blender", "DTU"])
+    parser.add_argument("--scene_type", default="DTU", choices=["Colmap", "Blender", "DTU"])
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
