@@ -48,8 +48,8 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
         if not skip_test:
             render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background)
 
-        if not skip_traj:
-            render_set(dataset.model_path, "trajectory", scene.loaded_iter, scene.getTrajCameras(), gaussians, pipeline, background)
+        # if not skip_traj:
+        #     render_set(dataset.model_path, "trajectory", scene.loaded_iter, scene.getTrajCameras(), gaussians, pipeline, background)
 
 if __name__ == "__main__":
     # Set up command line argument parser

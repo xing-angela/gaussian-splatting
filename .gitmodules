@@ -7,3 +7,6 @@
 [submodule "SIBR_viewers"]
 	path = SIBR_viewers
 	url = https://gitlab.inria.fr/sibr/sibr_core.git
+[submodule "mastr"]
+	path = mastr
+	url = https://github.com/xing-angela/mastr.git
