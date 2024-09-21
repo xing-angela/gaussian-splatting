@@ -319,6 +319,11 @@ def readBricsCameras(params_path, images_folder):
         new_K = new_K.astype(np.float32)
         extr = extr.astype(np.float32)
 
+        dist = os.path.join("/users/axing2/data/users/axing2/gaussian-splatting/data/brics-mobile/hello_mobile/dist", cam_name)
+        if not os.path.exists(dist):
+            os.makedirs(dist, exist_ok=True)
+        cv2.imwrite(os.path.join(dist, "00000.jpg"), img)
+
         fx, fy = new_K[0, 0], new_K[1, 1]
         fovx = 2 * math.atan(w / (2 * fx))
         fovy = 2 * math.atan(h / (2 * fy))
@@ -350,12 +355,14 @@ def readBricsCameras(params_path, images_folder):
 
 def readBricsSceneInfo(path, eval, traj):
     params_path = os.path.join(path, "calib", "params.txt")
-    images_folder = os.path.join(path, "images", "image")
+    # images_folder = os.path.join(path, "images", "image")
+    images_folder = os.path.join(path, "images")
     cam_infos = readBricsCameras(params_path, images_folder)
 
     if eval:
         # eval_cams = [1, 17, 18, 34, 44, 45] # for diva dataset
-        eval_cams = [1, 17] # for BRICS baby
+        # eval_cams = [1, 17] # for BRICS baby
+        eval_cams = [0, 8]
         train_cam_infos = [c for c in cam_infos if c.uid not in eval_cams]
         test_cam_infos = [c for c in cam_infos if c.uid in eval_cams]
     else:
@@ -377,7 +384,18 @@ def readBricsSceneInfo(path, eval, traj):
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
-    ply_path = os.path.join(path, "pc/dense/points3D.ply")
+    # ply_path = os.path.join(path, "pc/dense/points3D.ply")
+    # if not os.path.exists(ply_path):
+    #     print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+    #     try:
+    #         xyz, rgb, _ = read_points3D_binary(bin_path)
+    #     except:
+    #         xyz, rgb, _ = read_points3D_text(txt_path)
+    #     storePly(ply_path, xyz, rgb)
+
+    ply_path = os.path.join(path, "reconstruction/0/points3D.ply")
+    bin_path = os.path.join(path, "reconstruction/0/points3D.bin")
+    txt_path = os.path.join(path, "reconstruction/0/points3D.txt")
     if not os.path.exists(ply_path):
         print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
         try:
@@ -385,11 +403,6 @@ def readBricsSceneInfo(path, eval, traj):
         except:
             xyz, rgb, _ = read_points3D_text(txt_path)
         storePly(ply_path, xyz, rgb)
-
-    # this will sample points from a mesh
-    # xyz, rgb = sample_gaussians(path, 300000)
-    # storePly(ply_path, xyz, rgb)
-    
     try:
         pcd = fetchPly(ply_path)
     except:
