@@ -269,19 +269,18 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
 
 ########################################### BRICS Data ###########################################
 
-def sample_gaussians(path, sample_size, sample_mesh=False):
-    import trimesh
-    mesh_dir = os.path.join(path, "mesh")
-    mesh_name = os.listdir(mesh_dir)[0]
-    mesh = trimesh.load(os.path.join(mesh_dir, mesh_name), process=False, maintain_order=True)
-    points = mesh.sample(sample_size)
-    points_colors = torch.rand(points.shape)
-    return points, points_colors
+# plane_cameras = ["bric-rev5-001_cam0", "bric-rev5-011_cam0", "bric-rev5-024_cam0"] # plane
+up_cameras = ["bric-rev5-001_cam0", "bric-rev5-019_cam0"]
+right_cameras = ["bric-rev5-001_cam0", "bric-rev5-024_cam0"]
 
 def readBricsCameras(params_path, images_folder):
     params = param_utils.read_params(params_path)
 
     cam_infos = []
+    avg_fovx, avg_fovy = 0.0, 0.0
+    cam_centers = []
+    up = []
+    right = []
     for idx, cam in enumerate(params):
         extr = param_utils.get_extr(cam)
         K, dist = param_utils.get_intr(cam)
@@ -304,8 +303,21 @@ def readBricsCameras(params_path, images_folder):
         fovx = 2 * math.atan(w / (2 * fx))
         fovy = 2 * math.atan(h / (2 * fy))
 
+        # get the average fovs for trajectory setting
+        avg_fovx += fovx
+        avg_fovy += fovy
+
         R = np.transpose(extr[:, :3])
         T = extr[:, 3]
+
+        # get the camera translations for calculating trajectory centroid
+        cam_centers.append(T)
+
+        # gets the plane to calculate a world up vector
+        if cam_name in up_cameras:
+            up.append(T)
+        if cam_name in right_cameras:
+            right.append(T)
 
         # handles alpha channel if there's segmentation
         if img.shape[-1] == 4:
@@ -327,23 +339,132 @@ def readBricsCameras(params_path, images_folder):
         cam_info = CameraInfo(uid=cam["cam_id"], R=R, T=T, FovY=fovy, FovX=fovx, image=image,
                               image_path=img_path, image_name=img_name, width=int(w), height=int(h))
         cam_infos.append(cam_info)
+    
+    avg_fovx /= idx
+    avg_fovy /= idx
+    
+    return cam_infos, avg_fovx, avg_fovy, cam_centers, up, right
+
+# def look_at(camera_position, target_position, up_vector=np.array([0.0, 1.0, 0.0])):
+#     # Compute the forward vector (from camera to target)
+#     forward = target_position - camera_position
+#     forward /= np.linalg.norm(forward)
+    
+#     # Compute the right vector (perpendicular to forward and up)
+#     right = np.cross(up_vector, forward)
+#     right /= np.linalg.norm(right)
+    
+#     # Recompute the up vector (ensure orthogonality)
+#     up = np.cross(forward, right)
+    
+#     # Form the rotation matrix
+#     rotation_matrix = np.column_stack([right, up, forward])
+    
+#     return rotation_matrix
+
+# def trajectory(centroid, radius, num_cameras, height, fovx, fovy):
+#     angle_step = 2 * np.pi / num_cameras
+#     cam_infos = []
+
+#     for i in range(num_cameras):
+#         # Compute the camera's position on the circle (x, z coordinates)
+#         angle = i * angle_step
+#         camera_x = radius * np.cos(angle)
+#         camera_z = radius * np.sin(angle)
+#         T = np.array([camera_x, height, camera_z])
+        
+#         # Compute the rotation matrix (camera looks at the centroid)
+#         R = look_at(T, centroid)
+
+#         img = np.zeros((1000, 1600, 3)).astype(np.uint8)
+#         image = Image.fromarray(img)
+#         cam_name = f"{i:03d}"
+        
+#         cam_infos.append(CameraInfo(uid=i, R=R, T=T, FovY=fovy, FovX=fovx, image=image,
+#                         image_path=cam_name, image_name=f"{cam_name}.jpg", width=image.size[0], height=image.size[1]))
+#     return cam_infos
+
+def normalize(v):
+    norm = np.linalg.norm(v)
+    if norm == 0:
+        return v
+    return v / norm
+
+def trajectory_circle(radius, altitude, frames, center, fovx, fovy, up, right):
+    center_canon_x, center_canon_y, center_canon_z = center
+    print(center)
+
+    angles = np.linspace(0, 2 * np.pi, frames, endpoint=False)
+    cam_infos = []
+
+    # transform because the scene is tilted
+    canon_forward = normalize(np.cross(right, up))
+    canon_right = normalize(np.cross(up, canon_forward))
+    transform_R = np.column_stack((canon_right, up, canon_forward))
+    transform_matrix = np.column_stack((transform_R, [center_canon_x, center_canon_y, center_canon_z]))
+    transform_matrix = np.vstack([transform_matrix, [0.0, 0.0, 0.0, 1.0]])
+
+    for idx, angle in enumerate(angles):
+        room_x = radius * np.cos(angle)
+        room_y = -altitude # y is down
+        room_z = radius * np.sin(angle)
+
+        # translate the point from room space to canonical space
+        room_pos = np.array([room_x, room_y, room_z, 1.0])
+        canon_pos = transform_matrix @ room_pos
+        canon_pos /= canon_pos[3]
+        cam_T = canon_pos[:3]
+
+        # Compute rotation matrix
+        cam_forward = normalize(np.array([center_canon_x - canon_pos[0], 
+                                          center_canon_y - canon_pos[1], 
+                                          center_canon_z - canon_pos[2]]))
+        world_up = up
+        cam_right = normalize(np.cross(world_up, cam_forward))
+        cam_up = normalize(np.cross(cam_forward, cam_right))
+
+        # Rotation matrix columns are the right, up, and forward vectors
+        # cam_R = np.column_stack((cam_right, cam_up, cam_forward))
+        # R = np.transpose(np.column_stack((right, up, forward)))
+        cam_R = transform_matrix[:3, :3]
+
+        img = np.zeros((1000, 1600, 3)).astype(np.uint8)
+        # img = np.zeros((1080, 1920, 3)).astype(np.uint8)
+        image = Image.fromarray(img)
+
+        cam_name = f"{idx:03d}"
+
+        cam_infos.append(CameraInfo(uid=idx, R=cam_R, T=cam_T, FovY=fovy, FovX=fovx, image=image,
+                        image_path=cam_name, image_name=f"{cam_name}.jpg", width=image.size[0], height=image.size[1]))
+
     return cam_infos
 
 def readBricsSceneInfo(path, eval, traj):
     params_path = os.path.join(path, "calib", "params.txt")
     # images_folder = os.path.join(path, "images", "image")
     images_folder = os.path.join(path, "images")
-    cam_infos = readBricsCameras(params_path, images_folder)
+    cam_infos, avg_fovx, avg_fovy, cam_centers, up, right = readBricsCameras(params_path, images_folder)
 
     if eval:
         eval_cams = [0, 8]
         train_cam_infos = [c for c in cam_infos if c.uid not in eval_cams]
         test_cam_infos = [c for c in cam_infos if c.uid in eval_cams]
-        traj_cam_infos = [] # set this for actual demo
     else:
         train_cam_infos = cam_infos
         test_cam_infos = []
-        traj_cam_infos = [] # set this for actual demo
+
+    if traj:
+        # translations = np.array(cam_centers)
+        # centroid = np.mean(translations, axis=0)
+        centroid = np.array([0.0, 0.0, 0.0])
+        radius = 1
+        frames = 100
+        height = 0
+        up_vector = normalize(up[0] - up[1])
+        right_vector = normalize(right[0] - right[1])
+        traj_cam_infos = trajectory_circle(radius, height, frames, centroid, avg_fovx, avg_fovy, up_vector, right_vector)
+    else:
+        traj_cam_infos = []
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
