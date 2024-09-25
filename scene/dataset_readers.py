@@ -390,54 +390,88 @@ def normalize(v):
         return v
     return v / norm
 
+def eul2rot(theta) :
+
+    R = np.array([[np.cos(theta[1])*np.cos(theta[2]), np.sin(theta[0])*np.sin(theta[1])*np.cos(theta[2]) - np.sin(theta[2])*np.cos(theta[0]), np.sin(theta[1])*np.cos(theta[0])*np.cos(theta[2]) + np.sin(theta[0])*np.sin(theta[2])],
+                  [np.sin(theta[2])*np.cos(theta[1]), np.sin(theta[0])*np.sin(theta[1])*np.sin(theta[2]) + np.cos(theta[0])*np.cos(theta[2]), np.sin(theta[1])*np.sin(theta[2])*np.cos(theta[0]) - np.sin(theta[0])*np.cos(theta[2])],
+                  [-np.sin(theta[1]), np.sin(theta[0])*np.cos(theta[1]), np.cos(theta[0])*np.cos(theta[1])]])
+
+    return R
+
 def trajectory_circle(radius, altitude, frames, center, fovx, fovy, up, right):
-    center_canon_x, center_canon_y, center_canon_z = center
-    print(center)
-
-    angles = np.linspace(0, 2 * np.pi, frames, endpoint=False)
     cam_infos = []
-
-    # transform because the scene is tilted
-    canon_forward = normalize(np.cross(right, up))
-    canon_right = normalize(np.cross(up, canon_forward))
-    transform_R = np.column_stack((canon_right, up, canon_forward))
-    transform_matrix = np.column_stack((transform_R, [center_canon_x, center_canon_y, center_canon_z]))
-    transform_matrix = np.vstack([transform_matrix, [0.0, 0.0, 0.0, 1.0]])
-
+    
+    angles = np.linspace(0, 2 * np.pi, frames, endpoint=False)
     for idx, angle in enumerate(angles):
-        room_x = radius * np.cos(angle)
-        room_y = -altitude # y is down
-        room_z = radius * np.sin(angle)
+        x = radius * np.cos(angle)
+        y = 0
+        z = radius * np.sin(angle)
 
-        # translate the point from room space to canonical space
-        room_pos = np.array([room_x, room_y, room_z, 1.0])
-        canon_pos = transform_matrix @ room_pos
-        canon_pos /= canon_pos[3]
-        cam_T = canon_pos[:3]
+        T = np.array([x, y, z])
 
-        # Compute rotation matrix
-        cam_forward = normalize(np.array([center_canon_x - canon_pos[0], 
-                                          center_canon_y - canon_pos[1], 
-                                          center_canon_z - canon_pos[2]]))
-        world_up = up
-        cam_right = normalize(np.cross(world_up, cam_forward))
-        cam_up = normalize(np.cross(cam_forward, cam_right))
-
-        # Rotation matrix columns are the right, up, and forward vectors
-        # cam_R = np.column_stack((cam_right, cam_up, cam_forward))
-        # R = np.transpose(np.column_stack((right, up, forward)))
-        cam_R = transform_matrix[:3, :3]
+        euler = np.array([0, angle + np.pi/2, 0])
+        R = eul2rot(euler)
+        print(R)
 
         img = np.zeros((1000, 1600, 3)).astype(np.uint8)
-        # img = np.zeros((1080, 1920, 3)).astype(np.uint8)
         image = Image.fromarray(img)
-
+        idx = 0
         cam_name = f"{idx:03d}"
 
-        cam_infos.append(CameraInfo(uid=idx, R=cam_R, T=cam_T, FovY=fovy, FovX=fovx, image=image,
-                        image_path=cam_name, image_name=f"{cam_name}.jpg", width=image.size[0], height=image.size[1]))
-
+        cam_infos.append(CameraInfo(uid=idx, R=np.transpose(R), T=-R@T, FovY=fovy, FovX=fovx, image=image,
+                            image_path=cam_name, image_name=f"{cam_name}.jpg", width=image.size[0], height=image.size[1]))
+    
     return cam_infos
+
+# def trajectory_circle(radius, altitude, frames, center, fovx, fovy, up, right):
+#     return
+
+    # center_canon_x, center_canon_y, center_canon_z = center
+
+    # angles = np.linspace(0, 2 * np.pi, frames, endpoint=False)
+    # cam_infos = []
+
+    # # transform because the scene is tilted
+    # canon_forward = normalize(np.cross(right, up))
+    # canon_right = normalize(np.cross(up, canon_forward))
+    # transform_R = np.column_stack((canon_right, up, canon_forward))
+    # transform_matrix = np.column_stack((transform_R, [center_canon_x, center_canon_y, center_canon_z]))
+    # transform_matrix = np.vstack([transform_matrix, [0.0, 0.0, 0.0, 1.0]])
+
+    # for idx, angle in enumerate(angles):
+    #     room_x = radius * np.cos(angle)
+    #     room_y = -altitude # y is down
+    #     room_z = radius * np.sin(angle)
+
+    #     # translate the point from room space to canonical space
+    #     room_pos = np.array([room_x, room_y, room_z, 1.0])
+    #     canon_pos = transform_matrix @ room_pos
+    #     canon_pos /= canon_pos[3]
+    #     cam_T = canon_pos[:3]
+
+    #     # Compute rotation matrix
+    #     cam_forward = normalize(np.array([center_canon_x - canon_pos[0], 
+    #                                       center_canon_y - canon_pos[1], 
+    #                                       center_canon_z - canon_pos[2]]))
+    #     world_up = up
+    #     cam_right = normalize(np.cross(world_up, cam_forward))
+    #     cam_up = normalize(np.cross(cam_forward, cam_right))
+
+    #     # Rotation matrix columns are the right, up, and forward vectors
+    #     # cam_R = np.column_stack((cam_right, cam_up, cam_forward))
+    #     # R = np.transpose(np.column_stack((right, up, forward)))
+    #     cam_R = transform_matrix[:3, :3]
+
+    #     img = np.zeros((1000, 1600, 3)).astype(np.uint8)
+    #     # img = np.zeros((1080, 1920, 3)).astype(np.uint8)
+    #     image = Image.fromarray(img)
+
+    #     cam_name = f"{idx:03d}"
+
+    #     cam_infos.append(CameraInfo(uid=idx, R=cam_R, T=cam_T, FovY=fovy, FovX=fovx, image=image,
+    #                     image_path=cam_name, image_name=f"{cam_name}.jpg", width=image.size[0], height=image.size[1]))
+
+    # return cam_infos
 
 def readBricsSceneInfo(path, eval, traj):
     params_path = os.path.join(path, "calib", "params.txt")
@@ -457,7 +491,7 @@ def readBricsSceneInfo(path, eval, traj):
         # translations = np.array(cam_centers)
         # centroid = np.mean(translations, axis=0)
         centroid = np.array([0.0, 0.0, 0.0])
-        radius = 1
+        radius = 2
         frames = 100
         height = 0
         up_vector = normalize(up[0] - up[1])
