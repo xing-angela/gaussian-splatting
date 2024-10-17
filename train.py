@@ -11,6 +11,7 @@
 
 import os
 import torch
+import socket
 from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import render, network_gui
@@ -214,8 +215,14 @@ if __name__ == "__main__":
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
+    # find an open port
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(('', 0))  # Bind to any available port
+    port = s.getsockname()[1]
+    s.close()
+
     # Start GUI server, configure and run training
-    network_gui.init(args.ip, args.port)
+    network_gui.init(args.ip, port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.scene_type)
 

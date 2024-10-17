@@ -151,6 +151,7 @@ def read_points3D_binary(path_to_model_file):
             xyzs[p_id] = xyz
             rgbs[p_id] = rgb
             errors[p_id] = error
+
     return xyzs, rgbs, errors
 
 def read_intrinsics_text(path):

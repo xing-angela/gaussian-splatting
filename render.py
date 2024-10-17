@@ -9,6 +9,7 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import subprocess as sp
 import torch
 from scene import Scene
 import os
@@ -20,6 +21,7 @@ from utils.general_utils import safe_state
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import GaussianModel
+import torchvision.transforms.functional as F
 
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
@@ -28,11 +30,36 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     makedirs(render_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
 
+    parent_path = os.path.dirname(model_path)
+    session_name = os.path.basename(model_path)
+
+    output = os.path.join(parent_path, f"{session_name}.mp4")
+    logo_path = "/users/axing2/data/users/axing2/gaussian-splatting/metadata/logo/logo_small.png"
+
+    cmd_out = ['ffmpeg',
+            '-y',  # (optional) overwrite output file if it exists
+            '-hide_banner',
+            '-loglevel', 'error',
+            '-f', 'image2pipe',
+            '-r', str(60),  # frames per second
+            '-i', '-',  # The input comes from a pipe
+            '-i', logo_path, # Second input stream
+            '-filter_complex', "overlay=W-w-10:H-h-10", 
+            # '-filter_complex', "[0:v]minterpolate=fps=60,setpts=4*PTS[video];[video][1:v]overlay=W-w-10:H-h-10", 
+            '-c:v', 'h264',
+            output]
+
+    pipe = sp.Popen(cmd_out, stdin=sp.PIPE)
+
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
-        rendering = render(view, gaussians, pipeline, background)["render"]
+        rendering = torch.clamp(render(view, gaussians, pipeline, background)["render"], 0, 1)
+        rendered_img = F.to_pil_image(rendering.to("cpu"), mode="RGB")
+        rendered_img.save(pipe.stdin, "JPEG")
         gt = view.original_image[0:3, :, :]
-        torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
+        torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".jpg"))
         torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
+    pipe.stdin.close()
+    pipe.wait()
 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, skip_traj : bool, scene_type : str):
     with torch.no_grad():

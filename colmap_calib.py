@@ -25,6 +25,7 @@ from tqdm import tqdm
 from cv2 import aruco
 from glob import glob
 from argparse import ArgumentParser
+from utils.colmap_database import COLMAPDatabase
 import tempfile
 
 logging.getLogger().setLevel(logging.INFO)
@@ -54,9 +55,7 @@ def image_ids_to_pair_id(image_id1, image_id2):
 def array_to_blob(array):
     return array.tobytes()
 
-def blob_to_array(blob, dtype, shape=(-1,)):
-    return np.frombuffer(blob, dtype=dtype).reshape(*shape)
-
+###################################### MARKER CALIBRATION ######################################
 def get_images(args, db_path, image_dir):
     connection = sqlite3.connect(db_path)
     cursor = connection.cursor()
@@ -202,6 +201,281 @@ def exhaustive_match(image_ids, image_paths, db_path, args, image_id_desc, image
         for pair in image_pairs:
             f.write((" ".join(pair)).replace(image_dir + "/", "") + "\n")
 
+def marker_calib(db_path, image_path, input_image_path):
+    logging.info("Importing images in database")
+    subprocess.run([
+        "colmap", "feature_extractor",
+        "--database_path", db_path,
+        "--image_path", image_path,
+        "--ImageReader.single_camera_per_folder", "1",
+        "--ImageReader.camera_model", "OPENCV"]
+    )
+
+    logging.info("Exhaustive Matcher")
+    subprocess.run([
+        "colmap", "exhaustive_matcher", 
+        "--database_path", db_path,
+    ])
+
+    # image_ids, image_paths = get_images(args, db_path, input_image_path)
+    # image_id_desc = add_features(image_ids, image_paths, db_path)
+    # exhaustive_match(image_ids, image_paths, db_path, args, image_id_desc, input_image_path)
+
+    # logging.info("Performing geometric verification")
+    # subprocess.run([
+    #     "colmap", "matches_importer",
+    #     "--database_path", db_path,
+    #     "--match_list_path", f"{os.path.join(tmp_dir, 'match_list.txt')}",
+    #     "--match_type", "pairs",
+    #     "--SiftMatching.min_num_inliers", "1"
+    # ])
+
+    logging.info("Reconstructing")
+    recon_path = os.path.join(tmp_dir, "reconstruction")
+    create_dir(recon_path)
+    subprocess.run([
+        "colmap", "mapper",
+        "--database_path", db_path,
+        "--image_path", image_path,
+        "--output_path", recon_path,
+    ])
+
+    logging.info("Performing global bundle adjustment")
+    subprocess.run([
+        "colmap", "bundle_adjuster",
+        "--input_path", os.path.join(recon_path, "0"),
+        "--output_path", os.path.join(recon_path, "0"),
+        "--BundleAdjustment.refine_principal_point", "1",
+        "--BundleAdjustment.max_num_iterations", "1000"
+    ])
+
+    output_dir = os.path.join(tmp_dir, "output")
+    create_dir(output_dir)
+    subprocess.run([
+        "colmap", "model_converter",
+        "--input_path", os.path.join(recon_path, "0"),
+        "--output_path", output_dir,
+        "--output_type", "TXT"
+    ])
+
+    return recon_path
+
+################################################################################################
+
+####################################### MARKERLESS CALIB #######################################
+def cam_db_from_file(cam_file, db):
+    with open(cam_file) as f:
+        for line in f.readlines():
+            if line.startswith("#"):
+                continue
+            data = line.split()
+
+            cam_id = int(data[0])
+            model = 4
+            width = int(data[2])
+            height = int(data[3])
+            params = np.array([float(datum) for datum in data[4:]])
+            
+            db.update_camera(model, width, height, params, camera_id=cam_id)
+    
+    db.commit()
+
+def img_db_from_file(img_file, db):
+    with open(img_file) as f:
+        skip_next = False
+        for line in f.readlines():
+            if skip_next:
+                skip_next = False
+                continue
+            if line.startswith("#"):
+                continue
+            data = line.split()
+
+            img_id = int(data[0])
+            qw = float(data[1])
+            qx = float(data[2])
+            qy = float(data[3])
+            qz = float(data[4])
+            tx = float(data[5])
+            ty = float(data[6])
+            tz = float(data[7])
+            prior_q = np.array([qw, qx, qy, qz])
+            prior_t = np.array([tx, ty, tz])
+            cam_id = int(data[8])
+            name = data[9]
+
+            db.update_image(name, cam_id, prior_q=prior_q, prior_t=prior_t, image_id=img_id)
+            skip_next = True
+    
+    db.commit()
+
+def create_files(params_path, input_image_path):
+    create_dir(os.path.join(tmp_dir, "marker_calib"))
+
+    cam_out_path = os.path.join(tmp_dir, "marker_calib", "cameras.txt")
+    img_out_path = os.path.join(tmp_dir, "marker_calib", "images.txt")
+    points3d_path = os.path.join(tmp_dir,"marker_calib", "points3D.txt")
+    open(points3d_path, 'a').close()
+
+    image_names = []
+    image_dirs = list(sorted(glob(f"{input_image_path}/*cam*")))
+    for image_dir in image_dirs:
+        img_name = os.path.basename(sorted(glob(f"{image_dir}/*.jpg"))[0])
+        name = os.path.join(os.path.basename(image_dir), img_name)
+        image_names.append(name)
+
+    img_params = []
+    cam_params = []
+
+    # read the params file
+    with open(params_path) as f:
+        for line in f.readlines():
+            if line.startswith("#"):
+                continue
+            data = line.split()
+            cam_param = []
+            cam_param.append(int(data[0])) # camera id
+            cam_param.append("OPENCV") # model
+            cam_param.append(int(data[1])) # width
+            cam_param.append(int(data[2])) # height
+            cam_param += [float(datum) for datum in data[3:11]] # params
+            cam_params.append(tuple(cam_param))
+
+            img_param = []
+            img_param.append(int(data[0])) # image id
+            img_param.append(float(data[12])) # qw
+            img_param.append(float(data[13])) # qx
+            img_param.append(float(data[14])) # qy
+            img_param.append(float(data[15])) # qz
+            img_param.append(float(data[16])) # tx
+            img_param.append(float(data[17])) # ty
+            img_param.append(float(data[18])) # tz
+            img_param.append(int(data[0])) # cam id
+            img_param.append(image_names[int(data[0]) - 1]) # image_name
+            img_params.append(tuple(img_param))
+
+    np.savetxt(img_out_path, img_params, fmt="%s", newline="\n\n")
+    np.savetxt(cam_out_path, cam_params, fmt="%s")
+
+def markerless_calib(db_path, image_path, cam_file):
+    db = COLMAPDatabase.connect(db_path)
+    db.create_tables()
+    
+    logging.info("Feature Extraction")
+    subprocess.run([
+        "colmap", "feature_extractor", 
+        "--database_path", db_path, 
+        "--image_path", image_path,
+        "--ImageReader.camera_model", "OPENCV"
+    ])
+
+    # insert the cameras and images into the database
+    logging.info("Importing cameras and images in database")
+    create_files(cam_file, image_path)
+    cam_file_path = os.path.join(tmp_dir, "marker_calib", "cameras.txt")
+    cam_db_from_file(cam_file_path, db)
+    img_file_path = os.path.join(tmp_dir, "marker_calib", "images.txt")
+    img_db_from_file(img_file_path, db)
+
+    logging.info("Exhaustive Matcher")
+    subprocess.run([
+        "colmap", "exhaustive_matcher", 
+        "--database_path", db_path,
+    ])
+
+    # logging.info("Point Triangulation")
+    # recon_path = os.path.join(tmp_dir, "reconstruction", "0")
+    # create_dir(recon_path)
+    # subprocess.run([
+    #     "colmap", "point_triangulator", 
+    #     "--database_path", db_path,
+    #     "--image_path", image_path,
+    #     "--input_path", os.path.join(tmp_dir, "marker_calib"),
+    #     "--output_path", recon_path,
+    #     "--Mapper.tri_ignore_two_view_tracks", "1"
+    # ])
+
+    logging.info("Reconstructing")
+    recon_path = os.path.join(tmp_dir, "reconstruction")
+    create_dir(recon_path)
+    subprocess.run([
+        "colmap", "mapper",
+        "--database_path", db_path,
+        "--image_path", image_path,
+        "--output_path", recon_path,
+    ])
+
+    logging.info("Performing global bundle adjustment")
+    subprocess.run([
+        "colmap", "bundle_adjuster",
+        "--input_path", os.path.join(recon_path, "0"),
+        "--output_path", os.path.join(recon_path, "0"),
+        "--BundleAdjustment.refine_principal_point", "1",
+        "--BundleAdjustment.max_num_iterations", "1000"
+    ])
+
+    try:
+        shutil.rmtree(os.path.join(tmp_dir, "marker_calib"))
+    except OSError as e:
+        print(f"Error: {e}")
+
+    return recon_path
+
+################################################################################################
+
+def create_calib_file(colmap_output_dir, calib_output_dir):
+    # read images
+    image_params = []
+    with open(os.path.join(colmap_output_dir, "images.txt")) as f:
+        skip_next = False
+        for line in f.readlines():
+            if skip_next:
+                skip_next = False
+                continue
+            if line.startswith("#"):
+                continue
+            data = line.split()
+            param = []
+            param.append(int(data[8]))
+            param.append(data[9].split("/")[0])
+            param += [float(datum) for datum in data[1:8]]
+            image_params.append(tuple(param))
+            skip_next = True
+
+    images = np.array(image_params, dtype=[
+        ('cam_id', int), ('cam_name', '<U22'),
+        ('qvecw', float), ('qvecx', float), ('qvecy', float), ('qvecz', float),
+        ('tvecx', float), ('tvecy', float), ('tvecz', float)
+    ])
+
+    # Read cameras
+    cam_params = []
+    with open(os.path.join(colmap_output_dir, "cameras.txt")) as f:
+        for line in f.readlines():
+            if line.startswith("#"):
+                continue
+            data = line.split()
+            param = []
+            param.append(int(data[0]))
+            param.append(int(data[2]))
+            param.append(int(data[3]))
+            param += [float(datum) for datum in data[4:]]
+            cam_params.append(tuple(param))
+    cameras = np.array(cam_params, dtype=[
+        ('cam_id', int),
+        ('width', int), ('height', int),
+        ('fx', float), ('fy', float),
+        ('cx', float), ('cy', float),
+        ('k1', float), ('k2', float),
+        ('p1', float), ('p2', float),
+    ])
+
+    img_cams = rf.join_by('cam_id', cameras, images)
+    print("Number of cameras detected:"+str(len(cameras)))
+    if not os.path.exists(calib_output_dir):
+        create_dir(calib_output_dir)
+    np.savetxt(os.path.join(calib_output_dir, 'params.txt'), img_cams, fmt="%s", header=" ".join(img_cams.dtype.fields))
+
 def main(args):
     db_path = os.path.join(tmp_dir, "db.db")
     if args.separate_calib:
@@ -231,115 +505,23 @@ def main(args):
         except FileNotFoundError:
             pass
 
-    logging.info("Importing images in database")
-    subprocess.run([
-        "colmap", "feature_extractor",
-        "--database_path", db_path,
-        "--image_path", image_path,
-        "--ImageReader.single_camera_per_folder", "1",
-        "--ImageReader.camera_model", "OPENCV"]
-    )
-
-    # image_ids, image_paths = get_images(args, db_path, input_image_path)
-    # image_id_desc = add_features(image_ids, image_paths, db_path)
-    # exhaustive_match(image_ids, image_paths, db_path, args, image_id_desc, input_image_path)
-
-    logging.info("Exhaustive Matcher")
-    subprocess.run([
-        "colmap", "exhaustive_matcher", 
-        "--database_path", db_path,
-    ])
-
-    logging.info("Performing geometric verification")
-    subprocess.run([
-        "colmap", "matches_importer",
-        "--database_path", db_path,
-        "--match_list_path", f"{os.path.join(tmp_dir, 'match_list.txt')}",
-        "--match_type", "pairs",
-        "--SiftMatching.min_num_inliers", "1"
-    ])
-
-    logging.info("Reconstructing")
-    recon_path = os.path.join(tmp_dir, "reconstruction")
-    create_dir(recon_path)
-    subprocess.run([
-        "colmap", "mapper",
-        "--database_path", db_path,
-        "--image_path", image_path,
-        "--output_path", recon_path,
-    ])
-
-    logging.info("Performing global bundle adjustment")
-    subprocess.run([
-        "colmap", "bundle_adjuster",
-        "--input_path", os.path.join(recon_path, "0"),
-        "--output_path", os.path.join(recon_path, "0"),
-        "--BundleAdjustment.refine_principal_point", "1",
-        "--BundleAdjustment.max_num_iterations", "1000"
-    ])
+    # the initial calibration uses aruco marker detection to get initial camera parameters
+    if args.inital_calib:
+        recon_path = marker_calib(db_path, image_path, input_image_path)
+        recon_path = os.path.join(recon_path, "0")
+    else:
+        recon_path = markerless_calib(db_path, image_path, args.cam_file)
 
     output_dir = os.path.join(tmp_dir, "output")
     create_dir(output_dir)
     subprocess.run([
         "colmap", "model_converter",
-        "--input_path", os.path.join(recon_path, "0"),
+        "--input_path", os.path.join(recon_path),
         "--output_path", output_dir,
         "--output_type", "TXT"
     ])
-    # Read images
-    image_params = []
-    with open(os.path.join(output_dir, "images.txt")) as f:
-        skip_next = False
-        for line in f.readlines():
-            if skip_next:
-                skip_next = False
-                continue
-            if line.startswith("#"):
-                continue
-            data = line.split()
-            param = []
-            param.append(int(data[8]))
-            param.append(data[9].split("/")[0])
-            param += [float(datum) for datum in data[1:8]]
-            image_params.append(tuple(param))
-            skip_next = True
 
-    images = np.array(image_params, dtype=[
-        ('cam_id', int), ('cam_name', '<U22'),
-        ('qvecw', float), ('qvecx', float), ('qvecy', float), ('qvecz', float),
-        ('tvecx', float), ('tvecy', float), ('tvecz', float)
-    ])
-
-    # Read cameras
-    cam_params = []
-    with open(os.path.join(output_dir, "cameras.txt")) as f:
-        for line in f.readlines():
-            if line.startswith("#"):
-                continue
-            data = line.split()
-            param = []
-            param.append(int(data[0]))
-            param.append(int(data[2]))
-            param.append(int(data[3]))
-            param += [float(datum) for datum in data[4:]]
-            cam_params.append(tuple(param))
-    cameras = np.array(cam_params, dtype=[
-        ('cam_id', int),
-        ('width', int), ('height', int),
-        ('fx', float), ('fy', float),
-        ('cx', float), ('cy', float),
-        ('k1', float), ('k2', float),
-        ('p1', float), ('p2', float),
-    ])
-
-    img_cams = rf.join_by('cam_id', cameras, images)
-    print("Number of cameras detected:"+str(len(cameras)))
-    # if args.separate_calib:
-    #     create_dir(os.path.join(args.root_dir, 'calib'))
-    # np.savetxt(os.path.join(args.root_dir, 'calib', 'params.txt'), img_cams, fmt="%s", header=" ".join(img_cams.dtype.fields))
-    if not os.path.exists(os.path.join(args.calib_files_path, 'calib')):
-        create_dir(os.path.join(args.calib_files_path, 'calib'))
-    np.savetxt(os.path.join(args.calib_files_path, 'calib', 'params.txt'), img_cams, fmt="%s", header=" ".join(img_cams.dtype.fields))
+    create_calib_file(output_dir, os.path.join(args.calib_files_path, 'calib'))
 
     logging.warning(f"Stored the parameters at {os.path.join(args.calib_files_path, 'calib', 'params.txt')}")
 
@@ -349,9 +531,12 @@ if __name__ == "__main__":
     parser.add_argument("--separate_calib", action="store_true")
     parser.add_argument("--no-subdir", action="store_true")
     parser.add_argument('-o', '--calib-files-path', help='Path to save the raw calibration files', default=None, type=str)
+    parser.add_argument("--inital_calib", action="store_true", help="Whether to perform inital Aruco maker calibration")
+    parser.add_argument("--cam_file", type=str, default="./metadata/calib/params.txt", help="Path to the marker calibration file")
 
     args = parser.parse_args()
 
+    # will output all of the colmap results in the output path
     if args.calib_files_path is not None:
         os.makedirs(args.calib_files_path, exist_ok=True)
         tmp_dir = args.calib_files_path

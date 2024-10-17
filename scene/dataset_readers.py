@@ -26,6 +26,8 @@ from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
 from utils import param_utils
 from glob import glob
+from utils.graphics_utils import getWorld2View
+from vis_cams import show_raw_pointcloud_with_cams
 
 class CameraInfo(NamedTuple):
     uid: int
@@ -115,13 +117,21 @@ def fetchPly(path):
     positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
     colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
     normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
+
+    center = np.mean(positions, axis=0)
+    positions -= center
+
     return BasicPointCloud(points=positions, colors=colors, normals=normals)
 
-def storePly(path, xyz, rgb):
+def storePly(path, xyz, rgb, scale_factor=1.0, translation=np.array([0.0, 0.0, 0.0])):
     # Define the dtype for the structured array
     dtype = [('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
             ('nx', 'f4'), ('ny', 'f4'), ('nz', 'f4'),
             ('red', 'u1'), ('green', 'u1'), ('blue', 'u1')]
+    
+    # scales the scene according to the scale factor
+    xyz *= scale_factor
+    xyz -= translation
     
     normals = np.zeros_like(xyz)
 
@@ -268,19 +278,34 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
     return scene_info
 
 ########################################### BRICS Data ###########################################
-
-# plane_cameras = ["bric-rev5-001_cam0", "bric-rev5-011_cam0", "bric-rev5-024_cam0"] # plane
-up_cameras = ["bric-rev5-001_cam0", "bric-rev5-019_cam0"]
-right_cameras = ["bric-rev5-001_cam0", "bric-rev5-024_cam0"]
+interpolate_cameras = ["bric-rev5-002_cam0", "bric-rev5-023_cam0"]
+distance_cameras = ["bric-rev5-002_cam0", "bric-rev5-002_cam0"]
 
 def readBricsCameras(params_path, images_folder):
     params = param_utils.read_params(params_path)
 
+    centers = []
+
+    # get camera centers in world coordinates
+    for idx, cam in enumerate(params):
+        extr = param_utils.get_extr(cam)
+        r_w2c = extr[:, :3]
+        t_w2c = extr[:, 3]
+        center = -np.linalg.inv(r_w2c).dot(t_w2c)
+        centers.append(center)
+    
+    # get the scale factor
+    c1, c2 = centers[0], centers[1]
+    dist = abs(c1 - c2)
+    scale_factor = 250000 / dist[1] # ensure they are an absolute distance
+
+    # translation factor
+    cam_centers = np.array(centers)
+    translation = np.mean(cam_centers, axis=0)
+
     cam_infos = []
     avg_fovx, avg_fovy = 0.0, 0.0
-    cam_centers = []
-    up = []
-    right = []
+    interp_cams = []
     for idx, cam in enumerate(params):
         extr = param_utils.get_extr(cam)
         K, dist = param_utils.get_intr(cam)
@@ -307,17 +332,14 @@ def readBricsCameras(params_path, images_folder):
         avg_fovx += fovx
         avg_fovy += fovy
 
-        R = np.transpose(extr[:, :3])
-        T = extr[:, 3]
-
-        # get the camera translations for calculating trajectory centroid
-        cam_centers.append(T)
-
-        # gets the plane to calculate a world up vector
-        if cam_name in up_cameras:
-            up.append(T)
-        if cam_name in right_cameras:
-            right.append(T)
+        # scaling the camera parameters
+        R_w2c = extr[:, :3]
+        T_w2c = extr[:, 3] * scale_factor
+        cam_center = -np.linalg.inv(R_w2c).dot(T_w2c)
+        cam_center *= scale_factor
+        cam_center -= translation
+        T = -R_w2c @ cam_center # c2w
+        R = np.transpose(R_w2c)
 
         # handles alpha channel if there's segmentation
         if img.shape[-1] == 4:
@@ -338,51 +360,16 @@ def readBricsCameras(params_path, images_folder):
 
         cam_info = CameraInfo(uid=cam["cam_id"], R=R, T=T, FovY=fovy, FovX=fovx, image=image,
                               image_path=img_path, image_name=img_name, width=int(w), height=int(h))
+        
+        if cam_name in interpolate_cameras:
+            interp_cams.append(cam_info)
+
         cam_infos.append(cam_info)
     
     avg_fovx /= idx
     avg_fovy /= idx
     
-    return cam_infos, avg_fovx, avg_fovy, cam_centers, up, right
-
-# def look_at(camera_position, target_position, up_vector=np.array([0.0, 1.0, 0.0])):
-#     # Compute the forward vector (from camera to target)
-#     forward = target_position - camera_position
-#     forward /= np.linalg.norm(forward)
-    
-#     # Compute the right vector (perpendicular to forward and up)
-#     right = np.cross(up_vector, forward)
-#     right /= np.linalg.norm(right)
-    
-#     # Recompute the up vector (ensure orthogonality)
-#     up = np.cross(forward, right)
-    
-#     # Form the rotation matrix
-#     rotation_matrix = np.column_stack([right, up, forward])
-    
-#     return rotation_matrix
-
-# def trajectory(centroid, radius, num_cameras, height, fovx, fovy):
-#     angle_step = 2 * np.pi / num_cameras
-#     cam_infos = []
-
-#     for i in range(num_cameras):
-#         # Compute the camera's position on the circle (x, z coordinates)
-#         angle = i * angle_step
-#         camera_x = radius * np.cos(angle)
-#         camera_z = radius * np.sin(angle)
-#         T = np.array([camera_x, height, camera_z])
-        
-#         # Compute the rotation matrix (camera looks at the centroid)
-#         R = look_at(T, centroid)
-
-#         img = np.zeros((1000, 1600, 3)).astype(np.uint8)
-#         image = Image.fromarray(img)
-#         cam_name = f"{i:03d}"
-        
-#         cam_infos.append(CameraInfo(uid=i, R=R, T=T, FovY=fovy, FovX=fovx, image=image,
-#                         image_path=cam_name, image_name=f"{cam_name}.jpg", width=image.size[0], height=image.size[1]))
-#     return cam_infos
+    return cam_infos, avg_fovx, avg_fovy, interp_cams, scale_factor, translation
 
 def normalize(v):
     norm = np.linalg.norm(v)
@@ -400,6 +387,13 @@ def eul2rot(theta) :
 
 def trajectory_circle(radius, altitude, frames, center, fovx, fovy, up, right):
     cam_infos = []
+
+    # transform because the scene is tilted
+    canon_forward = normalize(np.cross(right, up))
+    canon_right = normalize(np.cross(up, canon_forward))
+    transform_R = np.column_stack((canon_right, up, canon_forward))
+    transform_matrix = np.column_stack((transform_R, center)) # center set to 0
+    transform_matrix = np.vstack([transform_matrix, [0.0, 0.0, 0.0, 1.0]])
     
     angles = np.linspace(0, 2 * np.pi, frames, endpoint=False)
     for idx, angle in enumerate(angles):
@@ -411,21 +405,44 @@ def trajectory_circle(radius, altitude, frames, center, fovx, fovy, up, right):
 
         euler = np.array([0, angle + np.pi/2, 0])
         R = eul2rot(euler)
-        print(R)
+        new_R = transform_R @ R
 
-        img = np.zeros((1000, 1600, 3)).astype(np.uint8)
+        img = np.zeros((1080, 1920, 3)).astype(np.uint8)
         image = Image.fromarray(img)
         idx = 0
         cam_name = f"{idx:03d}"
 
-        cam_infos.append(CameraInfo(uid=idx, R=np.transpose(R), T=-R@T, FovY=fovy, FovX=fovx, image=image,
+        cam_infos.append(CameraInfo(uid=idx, R=np.transpose(new_R), T=-new_R@T, FovY=fovy, FovX=fovx, image=image,
                             image_path=cam_name, image_name=f"{cam_name}.jpg", width=image.size[0], height=image.size[1]))
     
     return cam_infos
 
-# def trajectory_circle(radius, altitude, frames, center, fovx, fovy, up, right):
-#     return
+def trajectory_forward_circle(radius, frames, center, start_inset, distance_inset, fovx, fovy, R):
+    cam_infos = []
+    num_circles = 4
+    angles = np.linspace(0, 2 * np.pi * num_circles, frames, endpoint=False)
 
+    center[2] += start_inset
+    inset_step = distance_inset / frames
+
+    for idx, angle in enumerate(angles):
+        x = center[0] + radius * np.cos(angle)
+        y = center[1] + radius * np.sin(angle)
+        z = center[2] - inset_step * idx
+
+        T = np.array([x, y, z])
+
+        img = np.zeros((1080, 1920, 3)).astype(np.uint8)
+        image = Image.fromarray(img)
+
+        cam_name = f"{idx:03d}"
+
+        cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=fovy, FovX=fovx, image=image,
+                        image_path=cam_name, image_name=f"{cam_name}.jpg", width=image.size[0], height=image.size[1]))
+
+    return cam_infos
+
+# def trajectory_normalize(radius, altitude, frames, center, fovx, fovy, up, right):
     # center_canon_x, center_canon_y, center_canon_z = center
 
     # angles = np.linspace(0, 2 * np.pi, frames, endpoint=False)
@@ -473,11 +490,49 @@ def trajectory_circle(radius, altitude, frames, center, fovx, fovy, up, right):
 
     # return cam_infos
 
+def trajectory_orbit(cams, frames, radius, fovx, fovy):
+
+    cam_infos = []
+    cam1, _ = cams
+    
+    # Calculate the center and radius of the circular path
+    # get the camera translations for calculating trajectory centroid
+    cam1_center = -cam1.R.dot(cam1.T)
+
+    cx, cy, cz = cam1_center
+    # cy += 1500000
+    cz += 5500000
+
+    # Generate angles for a full circular path
+    t_angles = np.linspace(3*np.pi/2, 7*np.pi/2, frames)
+    r_angles = np.linspace(0, 2*np.pi, frames)
+
+    for idx, t_angle in enumerate(t_angles):
+        px, py, pz = np.array([cx, cy, cz]) + radius * np.array([np.cos(t_angle), 0, np.sin(t_angle)])
+
+        cam1_R = np.transpose(cam1.R) # cam1 rotation matrix in c2w
+        r_angle = r_angles[idx]
+        c2w_rotation = np.array([[np.cos(r_angle), 0, np.sin(r_angle)],
+                                 [0, 1, 0],
+                                 [-np.sin(r_angle), 0, np.cos(r_angle)]])
+        R = np.transpose(np.dot(c2w_rotation, cam1_R))
+        T = -np.dot(R.T, np.array([px, py, pz])) # translation is in w2c
+
+        img = np.zeros((1080, 1920, 3)).astype(np.uint8)
+        image = Image.fromarray(img)
+
+        cam_name = f"{idx:03d}"
+
+        cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=fovy, FovX=fovx, image=image,
+                        image_path=cam_name, image_name=f"{cam_name}.jpg", width=image.size[0], height=image.size[1]))
+
+    return cam_infos
+
 def readBricsSceneInfo(path, eval, traj):
+    # loads the camera parameters and creates the circle trajectory
     params_path = os.path.join(path, "calib", "params.txt")
-    # images_folder = os.path.join(path, "images", "image")
     images_folder = os.path.join(path, "images")
-    cam_infos, avg_fovx, avg_fovy, cam_centers, up, right = readBricsCameras(params_path, images_folder)
+    cam_infos, avg_fovx, avg_fovy, interp_cams, scene_scale, translation = readBricsCameras(params_path, images_folder)
 
     if eval:
         eval_cams = [0, 8]
@@ -488,39 +543,37 @@ def readBricsSceneInfo(path, eval, traj):
         test_cam_infos = []
 
     if traj:
-        # translations = np.array(cam_centers)
-        # centroid = np.mean(translations, axis=0)
-        centroid = np.array([0.0, 0.0, 0.0])
-        radius = 2
-        frames = 100
-        height = 0
-        up_vector = normalize(up[0] - up[1])
-        right_vector = normalize(right[0] - right[1])
-        traj_cam_infos = trajectory_circle(radius, height, frames, centroid, avg_fovx, avg_fovy, up_vector, right_vector)
+        radius = 2500000
+        frames = 1000
+
+        # single circle trajectory
+        # traj_cam_infos = trajectory_circle(radius, height, frames, centroid, avg_fovx, avg_fovy, up_vector, right_vector)
+
+        # circle trajectory moving inwards
+        # center_cam_name = "bric-rev5-005_cam0"
+        # center_cam = [c for c in cam_infos if c.image_path.split("/")[-2] == center_cam_name]
+        # centroid = center_cam[0].T
+        # R = center_cam[0].R
+        # inset = 2
+        # distance_inset = 800000
+        # traj_cams = trajectory_forward_circle(radius, frames, centroid, inset, distance_inset, avg_fovx, avg_fovy, R)
+        # reverse_traj_cam_infos = traj_cams[::-1]
+        # traj_cam_infos = traj_cams # + reverse_traj_cam_infos
+
+        # interpolate between middle cameras
+        traj_cam_infos = trajectory_orbit(interp_cams, frames, radius, avg_fovx, avg_fovy)
     else:
         traj_cam_infos = []
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
-    # ply_path = os.path.join(path, "pc/dense/points3D.ply")
-    # if not os.path.exists(ply_path):
-    #     print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
-    #     try:
-    #         xyz, rgb, _ = read_points3D_binary(bin_path)
-    #     except:
-    #         xyz, rgb, _ = read_points3D_text(txt_path)
-    #     storePly(ply_path, xyz, rgb)
-
+    # reads the initial point cloud
     ply_path = os.path.join(path, "reconstruction/0/points3D.ply")
     bin_path = os.path.join(path, "reconstruction/0/points3D.bin")
-    txt_path = os.path.join(path, "reconstruction/0/points3D.txt")
     if not os.path.exists(ply_path):
         print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
-        try:
-            xyz, rgb, _ = read_points3D_binary(bin_path)
-        except:
-            xyz, rgb, _ = read_points3D_text(txt_path)
-        storePly(ply_path, xyz, rgb)
+        xyz, rgb, _ = read_points3D_binary(bin_path)
+        storePly(ply_path, xyz, rgb, scale_factor=scene_scale, translation=translation)
     try:
         pcd = fetchPly(ply_path)
     except:
